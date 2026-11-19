@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "packages/WeirnotePythonAccount"
 EXECUTABLE = "WeirnotePythonAccount"
 BUNDLE_ID = "com.waterfallelephant.Weirnote.PythonAccount"
-APP_ICON = PACKAGE / "Resources" / "Weirnote.icon"
+APP_ICON = PACKAGE / "Resources" / "Weirnote.icns"
 
 
 def main() -> None:
@@ -54,17 +54,9 @@ def main() -> None:
         shutil.copy2(binaries / EXECUTABLE, executables / EXECUTABLE)
         resources = contents / "Resources"
         resources.mkdir()
-        icon_info = Path(temp) / "icon-info.plist"
-        subprocess.run([
-            "xcrun", "actool", str(APP_ICON), "--compile", str(resources),
-            "--platform", "macosx", "--minimum-deployment-target", "14.0",
-            "--app-icon", "Weirnote", "--output-partial-info-plist", str(icon_info),
-            "--output-format", "human-readable-text", "--warnings", "--notices",
-        ], check=True)
-        if not (resources / "Weirnote.icns").is_file():
-            raise RuntimeError("The Weirnote app icon was not built.")
+        shutil.copy2(APP_ICON, resources / APP_ICON.name)
         (contents / "Info.plist").write_bytes(plistlib.dumps({
-            **plistlib.loads(icon_info.read_bytes()),
+            "CFBundleIconFile": APP_ICON.stem,
             "CFBundleDisplayName": "Weirnote Python Account",
             "CFBundleExecutable": EXECUTABLE,
             "CFBundleIdentifier": bundle_id,

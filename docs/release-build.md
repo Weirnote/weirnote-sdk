@@ -5,6 +5,11 @@ The release tag and `core/Cargo.toml` version should agree. Use the Rust version
 and Xcode version documented in the [wheel workflow](../.github/workflows/wheels.yml).
 Run the build on Apple Silicon and Intel for the corresponding wheels.
 
+The helper uses the checked-in `Weirnote.icns` generated from the editable
+`Weirnote.icon` artwork. To regenerate it after an artwork change, run
+`bash scripts/generate-helper-icon.sh` with Xcode 27.2. Pass `--check` to
+compare the generated output with the tracked icon.
+
 The default build uses ad-hoc signing and a development callback identifier.
 It requires no Apple signing credentials.
 
