@@ -27,7 +27,7 @@ def build_helper(resources: Path, work: Path, version: str, arch: str, args: arg
         command.extend(["--variant", args.helper_variant])
     subprocess.run(command, check=True)
     executable = bundle / "Contents/MacOS/WeirnotePythonAccount"
-    subprocess.run(["lipo", "-verify_arch", arch, str(executable)], check=True)
+    subprocess.run(["lipo", str(executable), "-verify_arch", arch], check=True)
     resources.mkdir()
     archive = resources / "account-helper.zip"
     archive_command = ["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(bundle), str(archive)]
