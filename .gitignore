@@ -1,0 +1,13 @@
+.venv/
+/build/
+/core/target/
+/dist/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.doltlite
+*.doltlite-*
+*.weirnote-account
+
+.build/
+.swiftpm/

@@ -1,0 +1,9 @@
+Weirnote icon
+Copyright 2026 The Weirnote contributors
+
+The artwork in packages/WeirnotePythonAccount/Resources/Weirnote.icon is
+licensed under the Apache License, Version 2.0. The compiled helper icon
+is distributed under the same terms.
+
+Use of the Weirnote name and icon as project marks is governed by section 6
+of the Apache License. Uses beyond that section require separate permission.

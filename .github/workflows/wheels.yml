@@ -1,0 +1,65 @@
+name: macOS wheels
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install build tools
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          xcodebuild -version
+          python -m pip install wheel twine
+          python design/scripts/generate.py --check
+      - name: Build and check the wheel
+        env:
+          RUSTUP_TOOLCHAIN: "1.98.1"
+        run: |
+          python scripts/build-wheel.py
+          test -f dist/weirnote-*-py3-none-macosx_14_0_${{ matrix.arch }}.whl
+          python -m twine check --strict dist/*.whl
+      - name: Install and test with Python 3.11
+        env:
+          PYTHON: python
+        run: bash scripts/test-wheel.sh dist/*.whl
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install with uv and test with Python 3.14
+        env:
+          PYTHON: python
+          INSTALLER: uv
+        run: bash scripts/test-wheel.sh dist/*.whl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: weirnote-macos-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error

@@ -1,0 +1,35 @@
+[package]
+name = "weirnote-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+uniffi = { version = "=0.29.4", features = ["cli"] }
+thiserror = "=2.0.21"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["raw_value"] }
+unicode-normalization = "=0.1.24"
+unicode-segmentation = "=1.13.3"
+unicode-casefold = "=0.2.0"
+uuid = { version = "=1.26.1", features = ["v4"] }
+time = { version = "=0.3.55", features = ["parsing", "formatting"] }
+
+
+[features]
+conformance = []
+
+[build-dependencies]
+cc = "1.0"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+
+[[bin]]
+name = "core-conformance"
+path = "src/bin/core-conformance.rs"
+required-features = ["conformance"]
