@@ -1,7 +1,9 @@
 # Build the public macOS wheels
 
 Both the Python package and its Swift account helper build from this checkout.
-The release tag and `core/Cargo.toml` version should agree. Use the Rust version
+The Python package version is in `VERSION`. The version in `core/Cargo.toml`
+also identifies the bundled helper build. A documentation-only PyPI
+release can reuse the same signed helper and native library. Use the Rust version
 and Xcode version documented in the [wheel workflow](../.github/workflows/wheels.yml).
 Run the build on Apple Silicon and Intel for the corresponding wheels.
 

@@ -2,7 +2,7 @@
 
 Create, edit, and sync Weirnote libraries from Python. The SDK supports macOS 14 or later on Apple Silicon and Intel, with Python 3.11 or later. It bundles the Rust core and DoltLite engine in a platform-specific wheel.
 
-See the [Python API reference](docs/python-api.md) for the supported operations.
+See the [Python API reference](https://github.com/Weirnote/weirnote-sdk/blob/main/docs/python-api.md) for the supported operations. Visit [weirnote.com](https://weirnote.com/) for the Weirnote app.
 
 ## Build
 
@@ -14,7 +14,7 @@ python3 -m venv .venv
 .venv/bin/python scripts/build-wheel.py
 ```
 
-The script creates a wheel for the Rust host architecture in `dist/`. It compiles DoltLite and generates the Python bindings against the exact native library included in the wheel. The build downloads the pinned crates from crates.io when needed. It also compiles the Swift sign-in helper and bundles it with an ad-hoc signature. See the [release build instructions](docs/release-build.md) for Developer ID signing and notarization.
+The script creates a wheel for the Rust host architecture in `dist/`. It compiles DoltLite and generates the Python bindings against the exact native library included in the wheel. The build downloads the pinned crates from crates.io when needed. It also compiles the Swift sign-in helper and bundles it with an ad-hoc signature. See the [release build instructions](https://github.com/Weirnote/weirnote-sdk/blob/main/docs/release-build.md) for Developer ID signing and notarization.
 
 ## Use
 
@@ -35,7 +35,7 @@ with open_library("example.doltlite", create=True) as library:
     print(library.get_note(note.id).plain_text)
 ```
 
-[Apple sign-in and sync](docs/account-helper.md) use the bundled Weirnote Python Account helper. The SDK sets it up automatically.
+[Apple sign-in and sync](https://github.com/Weirnote/weirnote-sdk/blob/main/docs/account-helper.md) use the bundled Weirnote Python Account helper. The SDK sets it up automatically.
 
 ## Test the wheel
 
@@ -48,11 +48,11 @@ The tests install the wheel into a fresh virtual environment and exercise a synt
 
 ## Native source
 
-See [DoltLite source provenance and licenses](vendor/doltlite/README.md).
+See [DoltLite source provenance and licenses](https://github.com/Weirnote/weirnote-sdk/blob/main/vendor/doltlite/README.md).
 
 ## License
 
-Weirnote’s SDK code is available under the [Apache License, Version 2.0](LICENSE).
-See the [icon notice](licenses/Weirnote-Icon.txt) for the artwork and marks.
-The [DoltLite and SQLite terms](vendor/doltlite/licenses/LICENSE.md) and
-[Rust dependency notices](licenses/rust/THIRD-PARTY.txt) accompany every wheel.
+Weirnote’s SDK code is available under the [Apache License, Version 2.0](https://github.com/Weirnote/weirnote-sdk/blob/main/LICENSE).
+See the [icon notice](https://github.com/Weirnote/weirnote-sdk/blob/main/licenses/Weirnote-Icon.txt) for the artwork and marks.
+The [DoltLite and SQLite terms](https://github.com/Weirnote/weirnote-sdk/blob/main/vendor/doltlite/licenses/LICENSE.md) and
+[Rust dependency notices](https://github.com/Weirnote/weirnote-sdk/blob/main/licenses/rust/THIRD-PARTY.txt) accompany every wheel.

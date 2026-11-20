@@ -102,7 +102,8 @@ def main() -> None:
     native = build_dir / target / "release"
     lib = native / "libweirnote_core.dylib"
     with MANIFEST.open("rb") as manifest:
-        version = tomllib.load(manifest)["package"]["version"]
+        native_version = tomllib.load(manifest)["package"]["version"]
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     destination = args.out_dir.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination) as tmp:
@@ -122,7 +123,7 @@ def main() -> None:
         subprocess.run(["codesign", "--force", "--sign", "-", str(staged_lib)], check=True)
         subprocess.run(["codesign", "--verify", "--strict", str(staged_lib)], check=True)
 
-        build_helper(package / "_resources", temporary, version, arch, args)
+        build_helper(package / "_resources", temporary, native_version, arch, args)
 
         metadata = staged / f"weirnote-{version}.dist-info"
         licenses = metadata / "licenses"
@@ -141,6 +142,8 @@ def main() -> None:
             f"Version: {version}\n"
             "Summary: Python SDK for Weirnote libraries on macOS\n"
             "Requires-Python: >=3.11\n"
+            "Project-URL: Homepage, https://weirnote.com/\n"
+            "Project-URL: Documentation, https://github.com/Weirnote/weirnote-sdk/blob/main/docs/python-api.md\n"
             "Project-URL: Source, https://github.com/Weirnote/weirnote-sdk\n"
             "Project-URL: Issues, https://github.com/Weirnote/weirnote-sdk/issues\n"
             "Description-Content-Type: text/markdown\n"
