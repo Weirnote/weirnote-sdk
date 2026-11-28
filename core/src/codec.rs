@@ -1,4 +1,6 @@
-use crate::model::{BlockKind, Container, DocumentError, Mark, SemanticDocument, TextRun};
+use crate::model::{
+    BlockKind, Container, DocumentError, Mark, SemanticDocument, TextRun, CURRENT_DOCUMENT_VERSION,
+};
 use serde::{
     de::{self, MapAccess, Visitor},
     Deserialize,
@@ -148,7 +150,7 @@ fn version(raw: &RawValue) -> ResultD<u32> {
     let power = exponent - frac as i32 + (digits.len() - significant.len()) as i32;
     if power == 0 {
         if let Ok(v) = significant.parse::<u32>() {
-            if (1..=4).contains(&v) {
+            if (1..=CURRENT_DOCUMENT_VERSION).contains(&v) {
                 return Ok(v);
             }
         }
@@ -174,6 +176,8 @@ fn parse(raw: &RawValue) -> ResultD<SemanticDocument> {
             "checkbox" if ver >= 2 => BlockKind::Checkbox,
             "math" if ver >= 4 => BlockKind::Math,
             "math" if ver >= 2 => return Err(value("math version")),
+            "quote" if ver >= 5 => BlockKind::Quote,
+            "quote" if ver >= 2 => return Err(value("quote version")),
             _ => return Err(Decode::Unknown),
         };
         let checked = if kind == BlockKind::Checkbox {
@@ -190,6 +194,9 @@ fn parse(raw: &RawValue) -> ResultD<SemanticDocument> {
             keys(&r, &["id", "text", "marks"], ver, false)?;
             let run_id = uuid(field(&r, "id")?)?;
             let run_text = string(field(&r, "text")?)?;
+            if kind == BlockKind::Quote && run_text.contains('\n') {
+                return Err(value("block line feed"));
+            }
             let mut marks = Vec::new();
             if let Some(raw_marks) = r.get("marks") {
                 let list = array(raw_marks)?;

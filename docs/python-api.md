@@ -71,6 +71,7 @@ the classes and functions listed below from `weirnote`.
 | `library.schema_version` | `int`. The local database schema version. |
 | `library.close()` | `None`. Releases the database. Both library types also support `with`. |
 | `account_library.head` | `str \| None`. The local committed tip. |
+| `account_library.sync_now()` | `str`. Checkpoints saved edits, integrates the remote history, and returns the hash confirmed by the push. |
 | `account_library.push()` | `str`. Publishes the committed tip and returns its hash. Working edits stay local. |
 | `account_library.pull()` | `str \| None`. Fetches and merges into a clean library and returns the local tip. Merge commits preserve both histories. |
 | `account_library.reconcile(intended_commit: str)` | `Reconciliation`. Checks the remote’s relationship to the intended hash. Pending bootstrap recovery can complete the reservation after confirming publication. |
@@ -80,6 +81,51 @@ library. Network operations renew credentials and verify the local binding’s
 account, origin, and remote route. Use a separate path for each local copy.
 Libraries under the daily Mac app’s data directory are refused, including
 symlink aliases.
+
+## Sync from a multithreaded server
+
+The caller chooses when to save, commit and sync. `save_note()` persists a
+working edit before it returns. `commit()` creates local history. Call
+`sync_now()` when you want a bound library to checkpoint its saved working set,
+pull and publish. All three calls are synchronous.
+
+```python
+from weirnote import Client, Note
+
+client = Client(profile="scripts")
+with client.open_library("account.doltlite") as library:
+    library.save_note(Note.from_text("Saved before sync"))
+    published = library.sync_now()
+    print(published)
+```
+
+Local database steps run in admission order per file within a process.
+Handles on the same file share that order, including through symlink or case
+aliases. Independent files can make progress concurrently. Close seals one
+handle, waits for its accepted local operations and transfers, and leaves
+sibling handles usable. Keep the bound pathname and its account sidecar in
+place while handles are open. First-time bootstrap writes the binding beside
+the requested database pathname. Opening the bound pathname makes it the
+source for sync even if an offline handle opened a hard link first. Existing
+handles stay with their session after a native merge. A fresh open of a hard
+link that still points to the old inode opens that older file separately.
+
+Fetch and upload run on private copies, so local saves can continue during
+network waits. If an edit saved during fetch conflicts with incoming history,
+sync records both versions in history and uses the normal merge policy. When
+only notes are pending, unrelated edits stay in the working set. Pending
+catalog changes can cause the merge to checkpoint the whole working set.
+A save or commit during upload
+stays local until a later publication. The returned hash identifies the upload
+even if the local head advanced while it was in flight. A failed transfer can
+leave the checkpoint and merged history on disk for the next attempt. If the
+publication acknowledgement was lost, use `reconcile()` with the hash from
+`PublicationUnknown`.
+
+`push()` still publishes a committed head while leaving saved working edits
+local. `pull()` still requires a clean working set. Use `bootstrap_library()`
+for an account's first publication and `clone_library()` for an additional
+local copy.
 
 ## Notes, tags, and history
 

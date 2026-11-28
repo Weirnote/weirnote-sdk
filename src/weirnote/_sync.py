@@ -1,6 +1,6 @@
 """Account-bound libraries and explicit sync operations."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 import fcntl
@@ -11,6 +11,7 @@ import re
 import tempfile
 from threading import Lock
 from typing import Callable, Iterator, TypeVar, cast
+from weakref import WeakValueDictionary
 
 from . import weirnote_core as _core
 from ._account import Client, _Session
@@ -31,7 +32,8 @@ class Reconciliation(StrEnum):
 
 
 _PUBLISHED = {Reconciliation.EQUAL, Reconciliation.INTENDED_IS_ANCESTOR}
-_NATIVE_GATE = Lock()
+_NATIVE_GATES: WeakValueDictionary = WeakValueDictionary()
+_NATIVE_GATES_LOCK = Lock()
 _CoreSyncException = cast(type[Exception], _core.CoreSyncError)
 _T = TypeVar("_T")
 
@@ -144,14 +146,26 @@ def _authorized(
     raise AssertionError("unreachable")
 
 
+def _native_gate(key: tuple[str, str, str]):
+    with _NATIVE_GATES_LOCK:
+        gate = _NATIVE_GATES.get(key)
+        if gate is None:
+            gate = Lock()
+            _NATIVE_GATES[key] = gate
+        return gate
+
+
 @contextmanager
 def _transport(
     client: Client, session: _Session, route: _Route,
     reservation: _Reservation | None = None,
 ) -> Iterator[_core.CoreSync]:
-    # UniFFI installs credentials in one native route registry per process.
-    # Keep install, use and cleanup paired even when two callers share a route.
-    with _NATIVE_GATE:
+    # Credentials are installed by route URL and invalidated by account.
+    # Pair install and cleanup with use across both identities.
+    with (
+        _native_gate((client.origin, "account", session.identity.user_id)),
+        _native_gate((client.origin, "route", route.route_id)),
+    ):
         transport = None
         try:
             remaining = session.remaining_seconds()
@@ -192,54 +206,161 @@ class AccountLibrary(Library):
     """A library with offline editing and explicit network operations."""
 
     def __init__(self, client: Client, path: str | os.PathLike[str], *, create: bool = False):
-        path = library_path(path)
-        binding = _read_binding(path)
-        _scope(client, binding)
-        if create and binding is not None and not path.is_file():
-            raise SyncError(SyncFailure.ALREADY_EXISTS)
         self._client = client
         super().__init__(path, create=create)
+
+    def _select_source(self, path: Path, source: Path, create: bool, *, bootstrap: bool = False) -> Path:
+        binding = _read_binding(source)
+        if path != source:
+            alias_binding = _read_binding(path)
+            if alias_binding is not None:
+                if binding is not None and alias_binding != binding:
+                    raise SyncError(SyncFailure.ACCOUNT_MISMATCH)
+                if binding is None:
+                    source, binding = path, alias_binding
+        _scope(self._client, binding)
+        if create and binding is not None and not path.is_file():
+            raise SyncError(SyncFailure.ALREADY_EXISTS)
+        return path if bootstrap and binding is None else source
 
     @property
     def head(self) -> str | None:
         """The local committed head."""
-        return self._core.account_head()
+        with self._local() as core:
+            return core.account_head()
+
+    @contextmanager
+    def _transfer(self, prepare: Callable[[Path], _T], *, bootstrap: bool = False) -> Iterator[tuple[Path, _T]]:
+        """Capture the local input and pin its binding and lock pathname."""
+        with self._request() as ticket, ExitStack() as cleanup:
+            session = self._session
+
+            def release_source() -> None:
+                with session.changed:
+                    session.transfers -= 1
+                    session.changed.notify_all()
+
+            next_ticket: object | None = ticket
+            while True:
+                with session.turn(next_ticket):
+                    source = session.path
+                    if bootstrap:
+                        self._require_identity(self._requested_path, session.identity)
+                        source = self._select_source(self._requested_path, source, False, bootstrap=True)
+                    if self._use_source(session, source):
+                        directory = cleanup.enter_context(
+                            tempfile.TemporaryDirectory(dir=source.parent, prefix=".weirnote-sync-")
+                        )
+                        staged = Path(directory) / "library"
+                        captured = prepare(staged)
+                        # Select the bootstrap pathname and pin it in the
+                        # same turn so another alias cannot redirect it.
+                        with session.changed:
+                            cleanup.callback(release_source)
+                            session.transfers += 1
+                        break
+                next_ticket = None
+                with session.changed:
+                    session.changed.wait_for(lambda: not session.transfers)
+            yield staged, captured
+
+    def _snapshot(self, staged: Path) -> None:
+        self._check_source()
+        self._connection.recovery_snapshot(str(staged))
 
     def push(self) -> str:
         """Publish the local committed head and return its hash."""
-        with _exclusive(self._path):
-            intended = _commit_id(self.head)
-            self._run_ready(lambda transport: transport.push(intended))
+        def capture(staged: Path) -> str:
+            self._check_source()
+            intended = _commit_id(self._connection.account_head())
+            self._snapshot(staged)
             return intended
+
+        with self._transfer(capture) as (staged, intended):
+            with Library(staged) as copy, copy._local() as core:
+                core.account_hard_reset_staging(intended)
+            with _exclusive(self._path):
+                self._run_ready(staged, lambda transport: transport.push(intended))
+                return intended
 
     def pull(self) -> str | None:
         """Fetch and merge remote changes into a clean local library."""
-        with _exclusive(self._path):
-            if not self._core.account_is_clean():
+        def capture(staged: Path) -> None:
+            self._check_source()
+            if not self._connection.account_is_clean():
                 raise SyncError(SyncFailure.LOCAL_CHANGES)
-            if not self._run_ready(lambda transport: transport.pull_clean()):
-                raise SyncError(SyncFailure.LOCAL_CHANGES)
-            return self.head
+            self._snapshot(staged)
+
+        with self._transfer(capture) as (staged, _):
+            with _exclusive(self._path):
+                if not self._run_ready(staged, lambda transport: transport.pull_clean()):
+                    raise SyncError(SyncFailure.LOCAL_CHANGES)
+                with self._session.turn(), self._replacing_source():
+                    if not self._connection.account_merge_clean_from_file(str(staged)):
+                        raise SyncError(SyncFailure.LOCAL_CHANGES)
+                    return self._connection.account_head()
+
+    def sync_now(self) -> str:
+        """Checkpoint saved edits, integrate remote history, and publish the selected head."""
+        def capture(staged: Path) -> _Binding:
+            self._check_source()
+            binding = self._ready_binding()
+            self._connection.account_checkpoint()
+            self._snapshot(staged)
+            return binding
+
+        with self._transfer(capture) as (staged, binding):
+            publication = staged.with_name("publication")
+            intended: str | None = None
+
+            def synchronize(transport: _core.CoreSync) -> str:
+                nonlocal intended
+                if intended is None:
+                    if not transport.pull_clean():
+                        raise SyncError(SyncFailure.LOCAL_CHANGES)
+                    with self._session.turn():
+                        with self._replacing_source():
+                            self._connection.account_merge_keeping_pending_from_file(str(staged))
+                        head = _commit_id(self._connection.account_head())
+                        self._snapshot(publication)
+                    with Library(publication) as copy, copy._local() as core:
+                        core.account_hard_reset_staging(head)
+                    # A session renewal during push must retry this same hash.
+                    intended = head
+                transport.bind(str(publication))
+                transport.push(intended)
+                return intended
+
+            with _exclusive(self._path):
+                return self._run_ready(staged, synchronize, expected=binding)
 
     def reconcile(self, intended_commit: str) -> Reconciliation:
         """Compare an intended commit with the remote without pushing."""
         intended = _commit_id(intended_commit)
-        with _exclusive(self._path):
-            binding = _read_binding(self._path)
-            if binding and binding.pending_commit:
-                if binding.pending_commit != intended:
-                    raise PublicationUnknown(binding.pending_commit)
-                return self._bootstrap(allow_push=False)
-            return self._run_ready(lambda transport: _reconcile(transport, intended))
+        with self._transfer(self._snapshot) as (staged, _):
+            with _exclusive(self._path):
+                binding = _read_binding(self._path)
+                if binding and binding.pending_commit:
+                    if binding.pending_commit != intended:
+                        raise PublicationUnknown(binding.pending_commit)
+                    return self._bootstrap(staged, allow_push=False)
+                return self._run_ready(staged, lambda transport: _reconcile(transport, intended))
 
-    def _run_ready(self, operation: Callable[[_core.CoreSync], _T]) -> _T:
+    def _ready_binding(self) -> _Binding:
         binding = _read_binding(self._path)
         if binding is None:
             raise SyncError(SyncFailure.UNBOUND_LIBRARY)
         _scope(self._client, binding)
         if binding.pending_commit is not None:
             raise PublicationUnknown(binding.pending_commit)
-        _ = self.schema_version
+        return binding
+
+    def _run_ready(
+        self, staged: Path, operation: Callable[[_core.CoreSync], _T], *, expected: _Binding | None = None,
+    ) -> _T:
+        binding = self._ready_binding()
+        if expected is not None and binding != expected:
+            raise SyncError(SyncFailure.ACCOUNT_MISMATCH)
 
         def authorized(api: _Provisioning) -> _T:
             status = api.status()
@@ -248,21 +369,29 @@ class AccountLibrary(Library):
             if status.route != binding.route:
                 raise SyncError(SyncFailure.ACCOUNT_MISMATCH)
             with _transport(self._client, api.session, status.route) as transport:
-                transport.bind(str(self._path))
+                with self._session.turn():
+                    self._check_source()
+                    transport.bind(str(self._path))
+                transport.bind(str(staged))
                 return operation(transport)
 
         return _authorized(self._client, binding.user_id, authorized)
 
-    def _bootstrap(self, *, allow_push: bool) -> Reconciliation:
+    def _bootstrap(self, staged: Path, *, allow_push: bool) -> Reconciliation:
         def attempt(api: _Provisioning) -> Reconciliation:
             binding = _read_binding(self._path)
             status = api.status()
+            self._check_source()
             if binding is None:
-                if not allow_push or status.phase != "uninitialized" or self._core.account_has_remotes():
+                if not allow_push or status.phase != "uninitialized":
                     raise SyncError(SyncFailure.REMOTE_ALREADY_EXISTS)
-                if not self._core.account_is_clean():
-                    raise SyncError(SyncFailure.LOCAL_CHANGES)
-                binding = _Binding(self._client.origin, api.session.identity.user_id, None, _commit_id(self.head))
+                with Library(staged) as copy, copy._local() as core:
+                    if core.account_has_remotes():
+                        raise SyncError(SyncFailure.REMOTE_ALREADY_EXISTS)
+                    if not core.account_is_clean():
+                        raise SyncError(SyncFailure.LOCAL_CHANGES)
+                    head = _commit_id(core.account_head())
+                binding = _Binding(self._client.origin, api.session.identity.user_id, None, head)
                 _write_binding(self._path, binding)
             intended = binding.pending_commit
             if intended is None:
@@ -295,27 +424,24 @@ class AccountLibrary(Library):
             publish = reservation is not None and (not may_have_published or api.bootstrap_is_empty(route, reservation))
             if publish and not allow_push:
                 return Reconciliation.UNAVAILABLE
-            with tempfile.TemporaryDirectory(dir=self._path.parent, prefix=".weirnote-bootstrap-") as directory:
-                staged = Path(directory) / "library"
-                self._core.recovery_snapshot(str(staged))
-                with Library(staged) as copy:
-                    copy._core.account_hard_reset_staging(intended)
-                try:
-                    with _transport(self._client, api.session, route, reservation) as transport:
-                        transport.bind(str(staged))
-                        if binding.route is None:
-                            _write_binding(self._path, _Binding(binding.origin, binding.user_id, route, intended))
-                        if publish:
-                            transport.push(intended)
-                            outcome = Reconciliation.EQUAL
-                        else:
-                            outcome = _reconcile(transport, intended)
-                            if outcome not in _PUBLISHED:
-                                return outcome
-                except _NativeSyncError as error:
-                    if binding.route is None and error.publication == 1:
-                        _write_binding(self._path, binding)
-                    raise
+            with Library(staged) as copy, copy._local() as core:
+                core.account_hard_reset_staging(intended)
+            try:
+                with _transport(self._client, api.session, route, reservation) as transport:
+                    transport.bind(str(staged))
+                    if binding.route is None:
+                        _write_binding(self._path, _Binding(binding.origin, binding.user_id, route, intended))
+                    if publish:
+                        transport.push(intended)
+                        outcome = Reconciliation.EQUAL
+                    else:
+                        outcome = _reconcile(transport, intended)
+                        if outcome not in _PUBLISHED:
+                            return outcome
+            except _NativeSyncError as error:
+                if binding.route is None and error.publication == 1:
+                    _write_binding(self._path, binding)
+                raise
             if reservation is not None:
                 try:
                     route = api.complete(reservation, intended, route)
@@ -364,12 +490,13 @@ def clone_library(client: Client, path: str | os.PathLike[str]) -> AccountLibrar
 def bootstrap_library(client: Client, path: str | os.PathLike[str]) -> AccountLibrary:
     library = AccountLibrary(client, path)
     try:
-        with _exclusive(library._path):
-            outcome = library._bootstrap(allow_push=True)
-            if outcome not in _PUBLISHED:
-                binding = _read_binding(library._path)
-                assert binding is not None and binding.pending_commit is not None
-                raise PublicationUnknown(binding.pending_commit)
+        with library._transfer(library._snapshot, bootstrap=True) as (staged, _):
+            with _exclusive(library._path):
+                outcome = library._bootstrap(staged, allow_push=True)
+                if outcome not in _PUBLISHED:
+                    binding = _read_binding(library._path)
+                    assert binding is not None and binding.pending_commit is not None
+                    raise PublicationUnknown(binding.pending_commit)
         return library
     except BaseException:
         library.close()

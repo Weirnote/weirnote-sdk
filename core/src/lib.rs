@@ -2,6 +2,7 @@ pub mod account_import;
 pub mod account_ops;
 mod binding;
 mod codec_binding;
+pub mod departure;
 mod dev_fixture;
 #[cfg(test)]
 mod binding_tests;

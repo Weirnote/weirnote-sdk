@@ -88,7 +88,7 @@ impl CoreDevFixture {
         self.db.lock().map_err(|_| invalid_path())?.execute_batch(if enabled {"CREATE TRIGGER synthetic_save_failure BEFORE UPDATE OF document ON notes BEGIN SELECT RAISE(FAIL, 'synthetic save failure'); END"} else {"DROP TRIGGER synthetic_save_failure"}).map_err(error)
     }
     pub fn insert_opaque_fixture(&self, id: String) -> Result<(), BindingError> {
-        self.db.lock().map_err(|_| invalid_path())?.execute("INSERT INTO notes (id, document, created_at, updated_at, archived_at) VALUES (?, ?, '2024-01-02T03:04:05Z', '2024-02-03T04:05:06Z', NULL)", &[Value::Text(uid(&id)?),Value::Text(r#"{"version":5,"opaque":12345678901234567890}"#.into())]).map_err(error)?;
+        self.db.lock().map_err(|_| invalid_path())?.execute("INSERT INTO notes (id, document, created_at, updated_at, archived_at) VALUES (?, ?, '2024-01-02T03:04:05Z', '2024-02-03T04:05:06Z', NULL)", &[Value::Text(uid(&id)?),Value::Text(r#"{"version":6,"opaque":12345678901234567890}"#.into())]).map_err(error)?;
         Ok(())
     }
     pub fn stored_opaque_fixture(&self, id: String) -> Result<Option<String>, BindingError> {
@@ -105,7 +105,7 @@ impl CoreDevFixture {
     }
     pub fn create_opaque_history(&self, id: String) -> Result<Option<String>, BindingError> {
         let db = self.db.lock().map_err(|_| invalid_path())?;
-        db.execute("INSERT INTO notes (id, document, created_at, updated_at) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", &[Value::Text(uid(&id)?),Value::Text(r#"{"version":5,"future":{"keep":9007199254740993}}"#.into())]).map_err(error)?;
+        db.execute("INSERT INTO notes (id, document, created_at, updated_at) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", &[Value::Text(uid(&id)?),Value::Text(r#"{"version":6,"future":{"keep":9007199254740993}}"#.into())]).map_err(error)?;
         commit(&db, "opaque historical fixture")
     }
     pub fn replace_history_document(

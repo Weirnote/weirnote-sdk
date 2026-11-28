@@ -4,6 +4,8 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+pub(crate) const CURRENT_DOCUMENT_VERSION: u32 = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DocumentError {
     #[error("invalid JSON")]
@@ -29,6 +31,7 @@ pub enum BlockKind {
     Bullet,
     Checkbox,
     Math,
+    Quote,
 }
 impl BlockKind {
     pub fn as_str(self) -> &'static str {
@@ -39,6 +42,7 @@ impl BlockKind {
             Self::Bullet => "bullet",
             Self::Checkbox => "checkbox",
             Self::Math => "math",
+            Self::Quote => "quote",
         }
     }
 }
@@ -96,7 +100,7 @@ impl SemanticDocument {
         if self.opaque_json.is_some() {
             return Err(DocumentError::OpaqueDocument);
         }
-        if !(1..=4).contains(&self.version) {
+        if !(1..=CURRENT_DOCUMENT_VERSION).contains(&self.version) {
             return Err(DocumentError::UnsupportedVersion);
         }
         let mut result = self.clone();
@@ -184,7 +188,9 @@ impl SemanticDocument {
     }
 }
 fn minimum_version(containers: &[Container]) -> u32 {
-    if containers.iter().any(|c| c.kind == BlockKind::Math) {
+    if containers.iter().any(|c| c.kind == BlockKind::Quote) {
+        5
+    } else if containers.iter().any(|c| c.kind == BlockKind::Math) {
         4
     } else if containers.iter().any(|c| c.kind == BlockKind::Title) {
         3
@@ -278,14 +284,14 @@ pub fn format_timestamp(t: time::OffsetDateTime) -> String {
 impl SemanticDocument {
     pub fn is_plain_text_editable(&self) -> bool {
         self.opaque_json.is_none()
-            && (1..=4).contains(&self.version)
+            && (1..=CURRENT_DOCUMENT_VERSION).contains(&self.version)
             && self.containers.len() == 1
             && self.containers[0].kind == BlockKind::Text
             && self.containers[0].runs.iter().all(|r| r.marks.is_empty())
     }
     pub fn is_editable(&self) -> bool {
         self.opaque_json.is_none()
-            && (1..=4).contains(&self.version)
+            && (1..=CURRENT_DOCUMENT_VERSION).contains(&self.version)
             && self.containers.iter().all(|c| {
                 c.runs.iter().all(|r| {
                     r.marks

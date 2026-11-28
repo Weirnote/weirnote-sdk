@@ -55,7 +55,9 @@ def run_operation(client: Client, command: str, path: Path | None, intended_comm
             print(library.head)
         return
     with client.open_library(path) as library:
-        if command == "pull":
+        if command == "sync":
+            print(library.sync_now())
+        elif command == "pull":
             print(library.pull())
         elif command == "push":
             print(library.push())
@@ -66,7 +68,7 @@ def run_operation(client: Client, command: str, path: Path | None, intended_comm
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["sign-in", "identity", "sign-out", "edit",
-                                           "clone", "bootstrap", "pull", "push", "reconcile"])
+                                           "clone", "bootstrap", "sync", "pull", "push", "reconcile"])
     parser.add_argument("path", type=Path, nargs="?")
     parser.add_argument("--intended-commit")
     parser.add_argument("--origin", default="https://api.weirnote.com")

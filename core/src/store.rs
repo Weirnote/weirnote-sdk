@@ -171,7 +171,7 @@ fn optional(row: &Row, i: usize) -> Result<Option<&str>> {
         _ => Err(StoreError::MalformedRow("text")),
     }
 }
-fn upper(id: Uuid) -> String {
+pub(crate) fn upper(id: Uuid) -> String {
     id.to_string().to_uppercase()
 }
 fn text(s: impl Into<String>) -> Value {
@@ -214,8 +214,8 @@ struct LegacyArchive {
     date: String,
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct NoteSnapshot {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteSnapshot {
     pub note: Note,
     pub archived_at: Option<String>,
 }
@@ -582,6 +582,15 @@ impl Store {
                 "injected post-seal commit failure".into(),
             ));
         }
+        // A staged departure is committed first, as its own commit: `-A`
+        // would replace it with the working set.
+        if self.has_staged_changes()? {
+            let departure =
+                self.commit_staged_in_transaction(crate::departure::DEPARTURE_MESSAGE)?;
+            if !self.has_uncommitted_changes()? {
+                return Ok(departure);
+            }
+        }
         let row = match self
             .db
             .query_row("SELECT dolt_commit('-A','-m',?)", &[text(message)])
@@ -692,16 +701,24 @@ impl Store {
             .map(|r| self.note_snapshot(r, &tags))
             .collect()
     }
-    pub(crate) fn read_note_snapshot(&self, id: Uuid) -> Result<Option<NoteSnapshot>> {
-        self.validate_schema()?;
+    pub fn read_note_snapshot(&self, id: Uuid) -> Result<Option<NoteSnapshot>> {
+        self.read_note_snapshot_with_tags(id).map(|(note, _)| note)
+    }
+    /// Return the same tag definitions used to resolve the note's membership.
+    pub fn read_note_snapshot_with_tags(
+        &self,
+        id: Uuid,
+    ) -> Result<(Option<NoteSnapshot>, Vec<Tag>)> {
         let tags = self.all_tags()?;
-        self.db
+        let note = self
+            .db
             .query_row(
                 "SELECT id,document,created_at,updated_at,tags,archived_at FROM notes WHERE id=?",
                 &[text(upper(id))],
             )?
             .map(|row| self.note_snapshot(&row, &tags))
-            .transpose()
+            .transpose()?;
+        Ok((note, tags))
     }
     fn load(&self, all: bool) -> Result<Vec<Note>> {
         Ok(self
@@ -716,7 +733,7 @@ impl Store {
     pub fn load_all_notes(&self) -> Result<Vec<Note>> {
         self.load(true)
     }
-    fn sync_unlocked(&self, notes: &[Note], previous: &[Note]) -> Result<()> {
+    pub(crate) fn sync_unlocked(&self, notes: &[Note], previous: &[Note], supports_links: bool) -> Result<()> {
         let baseline: HashMap<_, _> = previous.iter().map(|n| (n.id, n)).collect();
         let changed: Vec<_> = notes
             .iter()
@@ -734,7 +751,13 @@ impl Store {
             {
                 let bytes = string(&row, 0)?.as_bytes();
                 let live = decode_stored(bytes)?;
-                if !live.is_editable() {
+                // A link-capable editor must have actually seen this linked row.
+                let editing_known_links = supports_links
+                    && live.opaque_json.is_none()
+                    && baseline
+                        .get(&note.id)
+                        .is_some_and(|prior| prior.document == live);
+                if !live.is_editable() && !editing_known_links {
                     let desired = encode_new(&note.document)?;
                     if desired != bytes {
                         return Err(StoreError::OpaqueDocumentConflict(note.id));
@@ -759,9 +782,12 @@ impl Store {
         previous: &[Note],
         _preserving_existing: bool,
     ) -> Result<()> {
-        self.transaction(|| self.sync_unlocked(notes, previous))
+        self.transaction(|| self.sync_unlocked(notes, previous, false))
     }
-    pub(crate) fn save_note_if_current(
+    pub(crate) fn sync_linked_documents(&self, notes: &[Note], previous: &[Note]) -> Result<()> {
+        self.transaction(|| self.sync_unlocked(notes, previous, true))
+    }
+    pub fn save_note_if_current(
         &self,
         mut desired: Note,
         expected: Option<NoteSnapshot>,
@@ -805,7 +831,7 @@ impl Store {
         previous: &[Note],
         message: &str,
     ) -> Result<Option<String>> {
-        self.transaction_with_commit(message, ||{self.sync_unlocked(notes,previous)?;self.db.execute_batch("INSERT OR REPLACE INTO app_metadata (key,value) VALUES ('legacy_import_completed',1)")?;Ok(((), true))}).map(|(_, hash)| hash)
+        self.transaction_with_commit(message, ||{self.sync_unlocked(notes,previous,false)?;self.db.execute_batch("INSERT OR REPLACE INTO app_metadata (key,value) VALUES ('legacy_import_completed',1)")?;Ok(((), true))}).map(|(_, hash)| hash)
     }
 }
 
@@ -2105,6 +2131,27 @@ mod lifecycle_tests {
         drop(store);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn link_edits_require_capability_and_current_document() {
+        let (store, path) = make();
+        let mut source = note("label");
+        source.document.containers[0].runs[0].marks.push(model::Mark::NoteLink {
+            id: Uuid::new_v4(),
+            target: Uuid::new_v4(),
+        });
+        store.sync(&[source.clone()], &[], false).unwrap();
+        let mut edit = source.clone();
+        edit.document.containers[0].runs[0].text = "new label".into();
+        assert!(store.sync(&[edit.clone()], &[source.clone()], false).is_err());
+        assert!(store.sync_linked_documents(&[edit.clone()], &[]).is_err());
+        store.sync_linked_documents(&[edit.clone()], &[source]).unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.load_notes().unwrap()[0].document, edit.document);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn nul_and_opaque_bytes_survive_unrelated_save() {
         let (store, path) = make();

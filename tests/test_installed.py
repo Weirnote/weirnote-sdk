@@ -1,7 +1,10 @@
 """Run with the interpreter of a clean venv after installing the SDK wheel."""
 
+from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -11,12 +14,107 @@ from uuid import UUID, uuid4
 from weirnote import (
     ArchivedNoteError, Bullet, Checkbox, DailyLibraryPathError, Document, Emphasis,
     Heading, Math, Note, NoteLinkMark, OpaqueDocument, OpaqueDocumentError,
-    Paragraph, Run, StaleNoteError, Strong, TagColor, TagShape, Title, open_library,
+    Paragraph, Quote, Run, StaleNoteError, Strong, TagColor, TagShape, Title, open_library,
 )
 import weirnote
+from weirnote._document import decode_document, encode_document
+from weirnote.weirnote_core import BindingError, CoreLibrary
 
 
 class InstalledWheelTests(unittest.TestCase):
+    def test_collecting_an_idle_handle_inside_a_siblings_turn_does_not_wait(self):
+        with TemporaryDirectory() as tmp:
+            code = """
+from pathlib import Path
+import sys
+from weirnote import Note, open_library
+
+path = Path(sys.argv[1])
+with open_library(path, create=True) as writer:
+    peer = open_library(path)
+    with writer._session.turn():
+        del peer
+    note = writer.save_note(Note.from_text("still usable"))
+with open_library(path) as reopened:
+    assert reopened.get_note(note.id).plain_text == "still usable"
+"""
+            subprocess.run([sys.executable, "-I", "-c", code, str(Path(tmp) / "notes.db")],
+                           check=True, timeout=5)
+
+    def test_same_file_fifo_captures_save_and_drains_on_close(self):
+        with TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=4) as pool:
+            root = Path(tmp)
+            path = root / "original.db"
+            with open_library(path, create=True) as writer, open_library(root / "other.db", create=True) as other:
+                alias = root / "alias.db"
+                os.link(path, alias)
+                with open_library(alias) as peer:
+                    self.assertIs(writer._session, peer._session)
+                    session = writer._session
+                    note = Note.from_text("accepted")
+                    with session.turn():
+                        save = pool.submit(writer.save_note, note)
+                        with session.changed:
+                            self.assertTrue(session.changed.wait_for(lambda: len(session.queue) == 2, 5))
+                        commit = pool.submit(peer.commit, "After the accepted save")
+                        with session.changed:
+                            self.assertTrue(session.changed.wait_for(lambda: len(session.queue) == 3, 5))
+                        closing = pool.submit(writer.close)
+                        with session.changed:
+                            self.assertTrue(session.changed.wait_for(lambda: writer._closing, 5))
+                        with self.assertRaises(BindingError.Closed):
+                            writer.notes()
+                        self.assertFalse(closing.done())
+                        note.document = Document.from_text("edited again")
+                        pool.submit(other.save_note, Note.from_text("independent")).result(5)
+                    self.assertIs(save.result(5), note)
+                    head = commit.result(5)
+                    closing.result(5)
+                    self.assertEqual(note.plain_text, "edited again")
+                    self.assertEqual(peer.get_note(note.id).plain_text, "accepted")
+                    self.assertEqual(peer.history(note.id)[0].commit_hash, head)
+                    peer.save_note(note)
+            with open_library(path) as reopened:
+                self.assertEqual(reopened.get_note(note.id).plain_text, "edited again")
+                self.assertEqual(reopened.history(note.id)[0].document.plain_text, "accepted")
+                with self.assertRaises(BindingError.Closed):
+                    writer.get_note(note.id)
+            with open_library(root / "other.db") as reopened:
+                self.assertEqual(reopened.notes()[0].plain_text, "independent")
+
+    def test_concurrent_opens_share_one_native_connection_and_failed_open_is_retryable(self):
+        with TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=2) as pool:
+            path = Path(tmp) / "original.db"
+            native_open = CoreLibrary.open
+            with patch.object(CoreLibrary, "open", side_effect=RuntimeError("open failed")):
+                with self.assertRaisesRegex(RuntimeError, "open failed"):
+                    open_library(path, create=True)
+            alias = Path(tmp) / "alias.db"
+            alias.symlink_to(path)
+            with patch.object(CoreLibrary, "open", wraps=native_open) as opened:
+                first = pool.submit(open_library, path)
+                second = pool.submit(open_library, alias)
+                with first.result(5) as writer, second.result(5) as reader:
+                    self.assertEqual(opened.call_count, 1)
+                    note = writer.save_note(Note.from_text("shared"))
+                    self.assertEqual(reader.get_note(note.id).plain_text, "shared")
+
+    def test_quote_uses_the_shared_canonical_bytes(self):
+        root = Path(__file__).resolve().parents[1]
+        rows = json.loads((root / "tests/fixtures/quote.json").read_text())
+        for row in rows:
+            if row["name"] not in ("v5-quote-mixed", "v5-quote-empty"):
+                continue
+            with self.subTest(name=row["name"]):
+                document = decode_document(row["document"])
+                self.assertIsInstance(document, Document)
+                assert isinstance(document, Document)
+                self.assertTrue(any(isinstance(block, Quote) for block in document.blocks))
+                self.assertEqual(document.plain_text, row["expected"]["plain_text"])
+                self.assertEqual(encode_document(document), row["canonical"])
+                without_quotes = Document([block for block in document.blocks if not isinstance(block, Quote)])
+                self.assertLess(json.loads(encode_document(without_quotes))["version"], 5)
+
     def test_native_library_loads_from_installed_package(self):
         package = Path(weirnote.__file__).parent
         self.assertIn("site-packages", package.parts)
@@ -68,6 +166,7 @@ class InstalledWheelTests(unittest.TestCase):
                     Bullet([Run("List")]),
                     Checkbox([Run("Check", [Strong(), Emphasis()])]),
                     Math([Run("x+y")]),
+                    Quote([Run("Cited text", [Strong()])]),
                     Paragraph([Run("Link", [NoteLinkMark(uuid4())])]),
                 ]))
                 writer.save_note(note)
@@ -89,7 +188,7 @@ class InstalledWheelTests(unittest.TestCase):
                 self.assertEqual(versions[1].document, baseline)
                 self.assertEqual(versions[0].document, note.document)
                 self.assertEqual(writer.commits()[0].hash, second)
-                self.assertEqual(note.plain_text, "Title\nHeading\nList\nCheck\nx+y\nLink")
+                self.assertEqual(note.plain_text, "Title\nHeading\nList\nCheck\nx+y\nCited text\nLink")
                 self.assertTrue(writer.archive_note(note.id))
                 self.assertEqual(writer.notes(), [])
                 archived = writer.notes(include_archived=True)[0]

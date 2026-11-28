@@ -3,7 +3,7 @@
 from ._account import AccountError, AccountFailure, Client, Identity
 from ._document import (
     Block, Bullet, Checkbox, Document, Emphasis, Heading, Mark, Math, NoteLinkMark,
-    OpaqueDocument, Paragraph, Run, Strong, Title,
+    OpaqueDocument, Paragraph, Quote, Run, Strong, Title,
 )
 from ._library import ArchivedNoteError, Library, OpaqueDocumentError, StaleNoteError, open_library
 from ._models import Commit, Note, Tag, TagColor, TagShape, Version
@@ -15,7 +15,7 @@ __all__ = [
     "AccountError", "AccountFailure", "AccountLibrary", "ArchivedNoteError", "Block", "Bullet", "Checkbox",
     "Client", "Commit", "DailyLibraryPathError", "Document", "Emphasis", "Heading", "Identity",
     "Library", "Mark", "Math", "Note", "NoteLinkMark",
-    "OpaqueDocument", "OpaqueDocumentError", "Paragraph", "PublicationUnknown", "Reconciliation",
+    "OpaqueDocument", "OpaqueDocumentError", "Paragraph", "PublicationUnknown", "Quote", "Reconciliation",
     "Run", "StaleNoteError", "Strong", "SyncError", "SyncFailure", "Tag", "TagColor", "TagShape",
     "Title", "Version", "open_library",
 ]

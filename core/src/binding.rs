@@ -122,6 +122,14 @@ pub fn inspect_account_working_set(path: String) -> Result<AccountWorkingSetReco
         clean: state.clean,
     })
 }
+/// Whether `head` is `commit` or descends from it, in the live library.
+#[uniffi::export]
+pub fn account_history_includes(path: String, head: String, commit: String) -> Result<bool, BindingError> {
+    if !Path::new(&path).is_file() {
+        return Err(BindingError::MissingFile { path });
+    }
+    Ok(crate::account_ops::account_history_includes(Path::new(&path), &head, &commit)?)
+}
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct LibrarySnapshotRecord {
     pub source_path: String,
@@ -643,6 +651,55 @@ impl CoreLibrary {
             .collect::<Result<Vec<_>, _>>()?;
         self.with(|s| Ok(s.sync(&notes, &previous, preserving_existing)?))
     }
+    pub fn save_linked_documents(
+        &self,
+        notes: Vec<NoteRecord>,
+        previous: Vec<NoteRecord>,
+    ) -> Result<(), BindingError> {
+        let notes = notes
+            .into_iter()
+            .map(Note::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let previous = previous
+            .into_iter()
+            .map(Note::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.with(|store| Ok(store.sync_linked_documents(&notes, &previous)?))
+    }
+    /// Stage HEAD plus these notes as a departure, leaving the working set.
+    /// See `Store::stage_notes`.
+    pub fn stage_departure(
+        &self,
+        departure: Vec<NoteRecord>,
+        excluded: Vec<String>,
+        working: Vec<NoteRecord>,
+        previous: Vec<NoteRecord>,
+        supports_links: bool,
+    ) -> Result<bool, BindingError> {
+        let notes = |records: Vec<NoteRecord>| {
+            records
+                .into_iter()
+                .map(Note::try_from)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let departure = notes(departure)?;
+        let working = notes(working)?;
+        let previous = notes(previous)?;
+        let excluded = excluded
+            .iter()
+            .map(|value| id(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.with(|store| {
+            Ok(store.stage_notes(&departure, &excluded, &working, &previous, supports_links)?)
+        })
+    }
+    /// Commit a staged departure, if any, leaving the working set.
+    pub fn commit_staged_departure(&self, message: String) -> Result<Option<String>, BindingError> {
+        self.with(|store| Ok(store.commit_staged(&message)?))
+    }
+    pub fn has_staged_departure(&self) -> Result<bool, BindingError> {
+        self.with(|store| Ok(store.has_staged_changes()?))
+    }
     pub fn commit(&self, message: String) -> Result<Option<String>, BindingError> {
         self.with(|s| Ok(s.commit_if_changed(&message)?))
     }
@@ -681,6 +738,18 @@ impl CoreLibrary {
     }
     pub fn account_merge_from_file(&self, source_path: String) -> Result<(), BindingError> {
         self.with(|store| Ok(store.account_merge_from_file(Path::new(&source_path))?))
+    }
+    pub fn account_merge_clean_from_file(&self, source_path: String) -> Result<bool, BindingError> {
+        self.with(|store| Ok(store.account_merge_clean_from_file(Path::new(&source_path))?))
+    }
+    /// Returns whether pending edits had to be committed before merging.
+    pub fn account_merge_keeping_pending_from_file(
+        &self,
+        source_path: String,
+    ) -> Result<bool, BindingError> {
+        self.with(|store| {
+            Ok(store.account_merge_keeping_pending_from_file(Path::new(&source_path))?)
+        })
     }
     pub fn account_hard_reset_staging(&self, reference: String) -> Result<(), BindingError> {
         self.with(|store| Ok(store.account_hard_reset_staging(&reference)?))

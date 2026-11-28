@@ -71,9 +71,16 @@ class Math(_Block):
     _kind = "math"
 
 
-Block = Paragraph | Title | Heading | Bullet | Checkbox | Math
+@dataclass
+class Quote(_Block):
+    """One quoted paragraph."""
+
+    _kind = "quote"
+
+
+Block = Paragraph | Title | Heading | Bullet | Checkbox | Math | Quote
 _BLOCK_TYPES: dict[str, type[Block]] = {
-    cls._kind: cls for cls in (Paragraph, Title, Heading, Bullet, Checkbox, Math)
+    cls._kind: cls for cls in (Paragraph, Title, Heading, Bullet, Checkbox, Math, Quote)
 }
 
 

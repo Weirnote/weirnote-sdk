@@ -119,6 +119,7 @@ impl TryFrom<CoreDocumentRecord> for SemanticDocument {
                 "bullet" => BlockKind::Bullet,
                 "checkbox" => BlockKind::Checkbox,
                 "math" => BlockKind::Math,
+                "quote" => BlockKind::Quote,
                 _ => {
                     return Err(CoreDocumentFailure::InvalidValue {
                         value: "container kind".into(),

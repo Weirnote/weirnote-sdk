@@ -1,12 +1,20 @@
 //! Named account-coordinator operations on a private staging library.
 use crate::{
     engine::{Connection, Value},
+    merge::{strings, write, Values, NOTE_COLUMNS},
     store::{coordinate_library, Store, StoreError},
 };
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, StoreError>;
+
+/// One note's committed and working rows, `None` where the row is absent.
+pub(crate) struct PendingNote {
+    pub(crate) id: String,
+    pub(crate) committed: Option<Values>,
+    pub(crate) working: Option<Values>,
+}
 
 /// A read-only, consistent view of the live account library's working state.
 pub struct AccountWorkingSet {
@@ -42,6 +50,23 @@ pub fn inspect_account_working_set(path: impl AsRef<Path>) -> Result<AccountWork
             "{error}; read transaction cleanup failed: {rollback}"
         ))),
     }
+}
+
+/// Whether the history of `head` contains `commit`: `head` is `commit` or
+/// descends from it. A sync uses this to tell whether a confirmed
+/// publication covers a particular local commit. Read-only.
+pub fn account_history_includes(path: impl AsRef<Path>, head: &str, commit: &str) -> Result<bool> {
+    if head == commit {
+        return Ok(true);
+    }
+    let db = Connection::open_readonly(path)?;
+    let base = db
+        .query_row("SELECT dolt_merge_base(?, ?)", &[head.into(), commit.into()])?
+        .and_then(|row| match row.get(0) {
+            Some(Value::Text(s)) => Some(s.clone()),
+            _ => None,
+        });
+    Ok(base.as_deref() == Some(commit))
 }
 
 struct Scratch(PathBuf);
@@ -130,6 +155,179 @@ impl Store {
         self.account_from_file(source.as_ref(), |staging, reference| {
             staging.merge_from(reference)
         })
+    }
+    pub(crate) fn account_merge_clean_from_file(&self, source: impl AsRef<Path>) -> Result<bool> {
+        match self.account_from_file(source.as_ref(), Store::merge_clean_from) {
+            Ok(()) => Ok(true),
+            Err(StoreError::PendingChanges) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    /// Merge committed main history into this live library while leaving its
+    /// uncommitted note edits uncommitted. A pending note that the incoming
+    /// history also changed is committed first and merged with the ordinary
+    /// conflict policy, so both versions stay in history; every other pending
+    /// note stays uncommitted. When anything other than notes is pending, all
+    /// pending work is committed first, exactly like `account_merge_from_file`.
+    /// Returns whether a checkpoint commit was needed.
+    pub fn account_merge_keeping_pending_from_file(
+        &self,
+        source: impl AsRef<Path>,
+    ) -> Result<bool> {
+        let mut checkpointed = false;
+        self.account_from_file(source.as_ref(), |staging, reference| {
+            checkpointed = staging.merge_keeping_pending(reference)?;
+            Ok(())
+        })?;
+        Ok(checkpointed)
+    }
+    fn merge_keeping_pending(&self, reference: &str) -> Result<bool> {
+        // A staged departure is history the user already made; the hard
+        // resets below would discard it.
+        self.commit_staged(crate::departure::DEPARTURE_MESSAGE)?;
+        if !self.has_uncommitted_changes()? {
+            self.merge_from(reference)?;
+            return Ok(false);
+        }
+        let Some((head, pending)) = self.pending_note_rows()? else {
+            self.merge_from(reference)?;
+            return Ok(true);
+        };
+        let reset = |hash: &str| -> Result<()> {
+            self.db
+                .execute("SELECT dolt_reset('--hard', ?)", &[Value::from(hash)])?;
+            Ok(())
+        };
+        reset(&head)?;
+        self.merge_clean_from(reference)?;
+        // A pending note conflicts when the clean merge changed its committed row.
+        let mut conflicting = Vec::new();
+        let mut unaffected = Vec::new();
+        for row in pending {
+            if self.note_row(&row.id)? == row.committed {
+                unaffected.push(row);
+            } else {
+                conflicting.push(row);
+            }
+        }
+        if conflicting.is_empty() {
+            self.apply_pending_notes(&unaffected)?;
+            return Ok(false);
+        }
+        // Commit only the conflicting edits, merge them with the ordinary
+        // policy, then put the unaffected edits back as working changes. The
+        // incoming history left those notes alone, so the merge result for
+        // them is the committed row the edits were made against.
+        reset(&head)?;
+        self.apply_pending_notes(&conflicting)?;
+        self.merge_from(reference)?;
+        for row in &unaffected {
+            if self.note_row(&row.id)? != row.committed {
+                return Err(StoreError::Database(
+                    "merge changed a note the incoming history did not touch".into(),
+                ));
+            }
+        }
+        self.apply_pending_notes(&unaffected)?;
+        Ok(true)
+    }
+    /// The committed HEAD and every note row whose working value differs from
+    /// it, or `None` when pending work is not limited to current-schema notes.
+    /// Only the changed rows are read, from DoltLite's HEAD-to-WORKING diff.
+    fn pending_note_rows(&self) -> Result<Option<(String, Vec<PendingNote>)>> {
+        if self.schema_version()? != 3 {
+            return Ok(None);
+        }
+        let tables = self.db.query("SELECT table_name FROM dolt_status", &[])?;
+        if tables
+            .iter()
+            .any(|row| row.get(0).and_then(Value::as_str) != Some("notes"))
+        {
+            return Ok(None);
+        }
+        let head = match self.db.query_row("SELECT dolt_hashof('HEAD')", &[])? {
+            Some(row) => match row.get(0) {
+                Some(Value::Text(hash)) => hash.clone(),
+                _ => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let pending = self.working_note_changes()?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((head, pending)))
+    }
+    /// Every note row whose working value differs from HEAD, read from
+    /// DoltLite's HEAD-to-WORKING diff, so only the changed rows are read.
+    pub(crate) fn working_note_changes(&self) -> Result<Vec<PendingNote>> {
+        let side = |prefix: &str| {
+            NOTE_COLUMNS
+                .iter()
+                .map(|c| format!("{prefix}_{c}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let rows = self.db.query(
+            &format!(
+                "SELECT diff_type,{},{} FROM dolt_diff_notes WHERE to_commit='WORKING'",
+                side("from"),
+                side("to")
+            ),
+            &[],
+        )?;
+        let width = NOTE_COLUMNS.len();
+        let mut pending = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let values = strings(row)?;
+            let kind = values
+                .first()
+                .cloned()
+                .flatten()
+                .ok_or(StoreError::MalformedRow("note diff"))?;
+            let from: Values = values[1..=width].to_vec();
+            let to: Values = values[1 + width..].to_vec();
+            let (committed, working) = match kind.as_str() {
+                "added" => (None, Some(to)),
+                "removed" => (Some(from), None),
+                "modified" => (Some(from), Some(to)),
+                _ => return Err(StoreError::MalformedRow("note diff")),
+            };
+            let id = working
+                .as_ref()
+                .or(committed.as_ref())
+                .and_then(|v| v.first().cloned().flatten())
+                .ok_or(StoreError::MalformedRow("note id"))?;
+            pending.push(PendingNote {
+                id,
+                committed,
+                working,
+            });
+        }
+        Ok(pending)
+    }
+    pub(crate) fn note_row(&self, id: &str) -> Result<Option<Values>> {
+        self.db
+            .query_row(
+                &format!("SELECT {} FROM notes WHERE id=?", NOTE_COLUMNS.join(",")),
+                &[Value::from(id)],
+            )?
+            .map(|row| strings(&row))
+            .transpose()
+    }
+    pub(crate) fn apply_pending_notes(&self, pending: &[PendingNote]) -> Result<()> {
+        for note in pending {
+            match &note.working {
+                Some(row) => write(&self.db, "notes", &NOTE_COLUMNS, row)?,
+                None => {
+                    self.db.execute(
+                        "DELETE FROM notes WHERE id=?",
+                        &[Value::from(note.id.as_str())],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
     fn account_from_file(
         &self,
@@ -232,7 +430,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::model::Note;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn concurrent_live_reads_and_snapshots_do_not_fail_writer() {
@@ -395,6 +593,24 @@ mod tests {
         assert_eq!(std::fs::read(&f.source_path).unwrap(), pending);
     }
     #[test]
+    fn history_includes_ancestors_and_not_later_or_unrelated_commits() {
+        let f = Fixture::new();
+        Fixture::save(&f.source, "first");
+        let first = f.source.account_checkpoint().unwrap().unwrap();
+        Fixture::save(&f.source, "second");
+        let second = f.source.account_checkpoint().unwrap().unwrap();
+        assert!(account_history_includes(&f.source_path, &second, &second).unwrap());
+        assert!(account_history_includes(&f.source_path, &second, &first).unwrap());
+        assert!(!account_history_includes(&f.source_path, &first, &second).unwrap());
+        Fixture::save(&f.target, "elsewhere");
+        let unrelated = f.target.account_checkpoint().unwrap().unwrap();
+        // A commit this library has never seen is never reported as covered.
+        assert!(!matches!(
+            account_history_includes(&f.source_path, &second, &unrelated),
+            Ok(true)
+        ));
+    }
+    #[test]
     fn private_memory_connections_do_not_require_a_filesystem_gate() {
         assert!(coordinate_library(Path::new(":memory:")).unwrap().is_none());
     }
@@ -506,6 +722,401 @@ mod tests {
             reopened.account_head().unwrap()
         );
     }
+    fn edit(store: &Store, note: &Note, text: &str, seconds: i64) -> Note {
+        let mut edited = note.clone();
+        edited.set_text(text);
+        edited.updated_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
+        store
+            .sync(&[edited.clone()], &[note.clone()], false)
+            .unwrap();
+        edited
+    }
+    fn text(store: &Store, id: Uuid) -> Option<String> {
+        store
+            .load_all_notes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id)
+            .map(|n| n.document.plain_text())
+    }
+    fn committed_document(store: &Store, id: Uuid) -> Option<String> {
+        store
+            .db
+            .query_row(
+                "SELECT document FROM dolt_at_notes('HEAD') WHERE lower(id)=lower(?)",
+                &[Value::from(id.to_string().to_uppercase())],
+            )
+            .unwrap()
+            .and_then(|row| row.get(0).and_then(Value::as_str).map(str::to_owned))
+    }
+    /// A shared base: the source starts as a copy of the target's history.
+    fn shared(f: &Fixture) -> (Note, Note, Store) {
+        let x = Fixture::save(&f.target, "x base");
+        let y = Fixture::save(&f.target, "y base");
+        f.target.account_checkpoint().unwrap();
+        let path = f.directory.join("shared source.doltlite");
+        std::fs::copy(&f.target_path, &path).unwrap();
+        (x, y, Store::open(&path).unwrap())
+    }
+
+    #[test]
+    fn merge_keeping_pending_commits_a_staged_departure_before_merging() {
+        let f = Fixture::new();
+        let (x, y, source) = shared(&f);
+        edit(&source, &y, "y remote", 20);
+        let remote_head = source.account_checkpoint().unwrap().unwrap();
+        let newer = edit(&f.target, &x, "x newer", 30);
+        let mut departed = x.clone();
+        departed.set_text("x departure");
+        assert!(f
+            .target
+            .stage_notes(&[departed], &[], &[], &[newer], false)
+            .unwrap());
+        let source_path = f.directory.join("shared source.doltlite");
+
+        assert!(!f
+            .target
+            .account_merge_keeping_pending_from_file(&source_path)
+            .unwrap());
+
+        let log = f.target.log(-1).unwrap();
+        assert!(log.iter().any(|e| e.hash == remote_head));
+        let departure = log
+            .iter()
+            .find(|e| e.message == crate::departure::DEPARTURE_MESSAGE)
+            .expect("the staged departure is committed, not reset away");
+        assert_eq!(document_at(&f.target, &departure.hash, x.id).map(|d| d.contains("x departure")), Some(true));
+        assert_eq!(text(&f.target, x.id).as_deref(), Some("x newer"));
+        assert_eq!(text(&f.target, y.id).as_deref(), Some("y remote"));
+        assert!(!f.target.has_staged_changes().unwrap());
+        assert!(!f.target.account_is_clean().unwrap());
+    }
+
+    #[test]
+    fn merge_keeps_pending_edit_uncommitted_when_incoming_leaves_its_note_alone() {
+        let f = Fixture::new();
+        let (x, y, source) = shared(&f);
+        let base_head = f.target.account_head().unwrap().unwrap();
+        edit(&source, &y, "y remote", 10);
+        let remote_head = source.account_checkpoint().unwrap().unwrap();
+        let draft = Note::from_text(
+            Uuid::new_v4(),
+            "first draft",
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let pending = edit(&f.target, &x, "x pending", 20);
+        f.target.sync(&[draft.clone()], &[], true).unwrap();
+        let committed_x = committed_document(&f.target, x.id);
+        let source_path = f.directory.join("shared source.doltlite");
+
+        assert!(!f
+            .target
+            .account_merge_keeping_pending_from_file(&source_path)
+            .unwrap());
+
+        let reopened = Store::open(&f.target_path).unwrap();
+        for store in [&f.target, &reopened] {
+            assert_eq!(store.account_head().unwrap(), Some(remote_head.clone()));
+            assert!(!store.account_is_clean().unwrap());
+            assert_eq!(text(store, x.id).as_deref(), Some("x pending"));
+            assert_eq!(text(store, y.id).as_deref(), Some("y remote"));
+            assert_eq!(text(store, draft.id).as_deref(), Some("first draft"));
+            assert_eq!(committed_document(store, x.id), committed_x);
+            assert_eq!(committed_document(store, draft.id), None);
+        }
+        let log: Vec<_> = reopened
+            .log(-1)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.hash)
+            .collect();
+        assert_eq!(log[..2], [remote_head, base_head]);
+        assert!(remotes(&reopened).is_empty());
+        // Committing later records only the user's pending edit.
+        assert_eq!(
+            reopened
+                .load_all_notes()
+                .unwrap()
+                .iter()
+                .find(|n| n.id == x.id)
+                .unwrap()
+                .updated_at,
+            pending.updated_at
+        );
+        assert!(reopened.commit_if_changed("Edit").unwrap().is_some());
+        assert_eq!(text(&reopened, x.id).as_deref(), Some("x pending"));
+    }
+
+    #[test]
+    fn merge_checkpoints_pending_edit_when_incoming_changed_the_same_note() {
+        for local_wins in [true, false] {
+            let f = Fixture::new();
+            let (x, _, source) = shared(&f);
+            edit(&source, &x, "x remote", 20);
+            let remote_head = source.account_checkpoint().unwrap().unwrap();
+            edit(&f.target, &x, "x pending", if local_wins { 30 } else { 10 });
+            let source_path = f.directory.join("shared source.doltlite");
+
+            assert!(f
+                .target
+                .account_merge_keeping_pending_from_file(&source_path)
+                .unwrap());
+
+            assert!(f.target.account_is_clean().unwrap());
+            let expected = if local_wins { "x pending" } else { "x remote" };
+            assert_eq!(text(&f.target, x.id).as_deref(), Some(expected));
+            let log = f.target.log(-1).unwrap();
+            assert!(log.iter().any(|e| e.hash == remote_head));
+            let checkpoint = log
+                .iter()
+                .find(|e| e.message == "Checkpoint before sync")
+                .expect("the losing local version stays recoverable");
+            let at: Option<String> = f
+                .target
+                .db
+                .query_row(
+                    "SELECT document FROM dolt_at_notes(?) WHERE lower(id)=lower(?)",
+                    &[
+                        Value::from(checkpoint.hash.clone()),
+                        Value::from(x.id.to_string().to_uppercase()),
+                    ],
+                )
+                .unwrap()
+                .and_then(|row| row.get(0).and_then(Value::as_str).map(str::to_owned));
+            assert!(at.unwrap().contains("x pending"));
+        }
+    }
+
+    fn document_at(store: &Store, commit: &str, id: Uuid) -> Option<String> {
+        store
+            .db
+            .query_row(
+                "SELECT document FROM dolt_at_notes(?) WHERE lower(id)=lower(?)",
+                &[Value::from(commit), Value::from(id.to_string())],
+            )
+            .unwrap()
+            .and_then(|row| row.get(0).and_then(Value::as_str).map(str::to_owned))
+    }
+
+    #[test]
+    fn same_note_conflict_commits_only_that_note_and_keeps_other_pending_edits_local() {
+        for local_wins in [true, false] {
+            let f = Fixture::new();
+            let (x, y, source) = shared(&f);
+            let base_head = f.target.account_head().unwrap().unwrap();
+            let base_y = committed_document(&f.target, y.id);
+            edit(&source, &x, "x remote", 20);
+            let remote_head = source.account_checkpoint().unwrap().unwrap();
+            edit(&f.target, &x, "x pending", if local_wins { 30 } else { 10 });
+            let pending_y = edit(&f.target, &y, "y pending", 40);
+            let draft = Note::from_text(
+                Uuid::new_v4(),
+                "unrelated draft",
+                time::OffsetDateTime::UNIX_EPOCH,
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            f.target.sync(&[draft.clone()], &[], true).unwrap();
+            let source_path = f.directory.join("shared source.doltlite");
+
+            assert!(f
+                .target
+                .account_merge_keeping_pending_from_file(&source_path)
+                .unwrap());
+
+            let reopened = Store::open(&f.target_path).unwrap();
+            let expected_x = if local_wins { "x pending" } else { "x remote" };
+            for store in [&f.target, &reopened] {
+                // Working state: the merged x and the untouched pending edits.
+                assert!(!store.account_is_clean().unwrap());
+                assert_eq!(text(store, x.id).as_deref(), Some(expected_x));
+                assert_eq!(text(store, y.id).as_deref(), Some("y pending"));
+                assert_eq!(text(store, draft.id).as_deref(), Some("unrelated draft"));
+                // Committed HEAD (what a push publishes) holds x's merge and
+                // neither unrelated pending edit.
+                let head = store.account_head().unwrap().unwrap();
+                assert!(document_at(store, &head, x.id)
+                    .unwrap()
+                    .contains(expected_x));
+                assert_eq!(committed_document(store, y.id), base_y);
+                assert_eq!(committed_document(store, draft.id), None);
+            }
+            let log = reopened.log(-1).unwrap();
+            assert!(log.iter().any(|e| e.hash == remote_head));
+            assert!(log.iter().any(|e| e.hash == base_head));
+            let checkpoint = log
+                .iter()
+                .find(|e| e.message == "Checkpoint before sync")
+                .expect("the conflicting local version stays recoverable");
+            assert!(document_at(&reopened, &checkpoint.hash, x.id)
+                .unwrap()
+                .contains("x pending"));
+            // No commit anywhere in history holds the unrelated pending work.
+            for entry in &log {
+                assert!(!document_at(&reopened, &entry.hash, y.id)
+                    .unwrap_or_default()
+                    .contains("y pending"));
+                assert_eq!(document_at(&reopened, &entry.hash, draft.id), None);
+            }
+            // The local working set still diffs from HEAD by exactly those edits.
+            let pending = reopened.pending_note_rows().unwrap().unwrap().1;
+            let mut changed: Vec<_> = pending.iter().map(|p| p.id.to_lowercase()).collect();
+            changed.sort();
+            let mut wanted = vec![y.id.to_string(), draft.id.to_string()];
+            wanted.sort();
+            assert_eq!(changed, wanted);
+            assert_eq!(
+                reopened
+                    .load_all_notes()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n.id == y.id)
+                    .unwrap()
+                    .updated_at,
+                pending_y.updated_at
+            );
+        }
+    }
+
+    #[test]
+    fn pending_rows_come_from_the_working_diff_for_every_kind_of_change() {
+        let f = Fixture::new();
+        let large = "large unaffected paragraph ".repeat(80_000);
+        let big = Fixture::save(&f.target, &large);
+        let kept = Fixture::save(&f.target, "kept");
+        let updated = Fixture::save(&f.target, "before update");
+        let removed = Fixture::save(&f.target, "to remove");
+        f.target.account_checkpoint().unwrap();
+        let head = f.target.account_head().unwrap().unwrap();
+        edit(&f.target, &updated, "after update", 50);
+        let added = Fixture::save(&f.target, "added");
+        f.target
+            .db
+            .execute(
+                "DELETE FROM notes WHERE lower(id)=lower(?)",
+                &[Value::from(removed.id.to_string())],
+            )
+            .unwrap();
+
+        // The reference result: compare every row at WORKING and HEAD.
+        let columns = NOTE_COLUMNS.join(",");
+        let all = |sql: String| -> HashMap<String, Values> {
+            f.target
+                .db
+                .query(&sql, &[])
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    let values = strings(row).unwrap();
+                    (values[0].clone().unwrap(), values)
+                })
+                .collect()
+        };
+        let working = all(format!("SELECT {columns} FROM notes"));
+        let committed = all(format!("SELECT {columns} FROM dolt_at_notes('{head}')"));
+        let mut expected: Vec<(String, Option<Values>, Option<Values>)> = working
+            .keys()
+            .chain(committed.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|id| working.get(*id) != committed.get(*id))
+            .map(|id| {
+                (
+                    id.clone(),
+                    committed.get(id).cloned(),
+                    working.get(id).cloned(),
+                )
+            })
+            .collect();
+        expected.sort();
+
+        let (diff_head, pending) = f.target.pending_note_rows().unwrap().unwrap();
+        assert_eq!(diff_head, head);
+        let mut actual: Vec<_> = pending
+            .into_iter()
+            .map(|p| (p.id, p.committed, p.working))
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+        let ids: HashSet<_> = actual.iter().map(|p| p.0.to_lowercase()).collect();
+        assert_eq!(
+            ids,
+            HashSet::from([
+                updated.id.to_string(),
+                added.id.to_string(),
+                removed.id.to_string()
+            ])
+        );
+        assert!(!ids.contains(&big.id.to_string()) && !ids.contains(&kept.id.to_string()));
+
+        // Merging with no incoming change keeps all three kinds pending.
+        let source_path = f.directory.join("source copy.doltlite");
+        std::fs::copy(&f.target_path, &source_path).unwrap();
+        let source = Store::open(&source_path).unwrap();
+        source
+            .db
+            .execute(
+                "SELECT dolt_reset('--hard', ?)",
+                &[Value::from(head.clone())],
+            )
+            .unwrap();
+        edit(&source, &kept, "kept remote", 60);
+        source.account_checkpoint().unwrap();
+        drop(source);
+        assert!(!f
+            .target
+            .account_merge_keeping_pending_from_file(&source_path)
+            .unwrap());
+        assert_eq!(text(&f.target, updated.id).as_deref(), Some("after update"));
+        assert_eq!(text(&f.target, added.id).as_deref(), Some("added"));
+        assert_eq!(text(&f.target, removed.id), None);
+        assert_eq!(text(&f.target, kept.id).as_deref(), Some("kept remote"));
+        assert_eq!(text(&f.target, big.id).as_deref(), Some(large.as_str()));
+        let merged_head = f.target.account_head().unwrap().unwrap();
+        assert!(document_at(&f.target, &merged_head, removed.id).is_some());
+        assert!(document_at(&f.target, &merged_head, added.id).is_none());
+        assert!(document_at(&f.target, &merged_head, updated.id)
+            .unwrap()
+            .contains("before update"));
+    }
+
+    #[test]
+    fn merge_keeping_pending_on_clean_library_matches_ordinary_merge() {
+        let f = Fixture::new();
+        let (_, y, source) = shared(&f);
+        edit(&source, &y, "y remote", 10);
+        let remote_head = source.account_checkpoint().unwrap().unwrap();
+        let source_path = f.directory.join("shared source.doltlite");
+        assert!(!f
+            .target
+            .account_merge_keeping_pending_from_file(&source_path)
+            .unwrap());
+        assert!(f.target.account_is_clean().unwrap());
+        assert_eq!(f.target.account_head().unwrap(), Some(remote_head));
+        assert_eq!(text(&f.target, y.id).as_deref(), Some("y remote"));
+    }
+
+    #[test]
+    fn failed_keeping_merge_leaves_pending_library_untouched() {
+        let f = Fixture::new();
+        let (x, y, source) = shared(&f);
+        edit(&source, &y, "y remote", 10);
+        source.account_checkpoint().unwrap();
+        edit(&f.target, &x, "x pending", 20);
+        let fingerprint = f.target.recovery_fingerprint().unwrap();
+        let source_path = f.directory.join("shared source.doltlite");
+        for failure in [1, 2] {
+            fail_at(failure);
+            assert!(f
+                .target
+                .account_merge_keeping_pending_from_file(&source_path)
+                .is_err());
+            assert_eq!(f.target.recovery_fingerprint().unwrap(), fingerprint);
+            assert_eq!(text(&f.target, x.id).as_deref(), Some("x pending"));
+            assert!(!f.target.account_is_clean().unwrap());
+        }
+    }
+
     #[test]
     fn failed_adoption_preserves_existing_staging_and_source() {
         let f = Fixture::new();
